@@ -18,7 +18,7 @@ limitations under the License.
 import logging
 import os
 import time
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +30,21 @@ from pypaimon.manifest.manifest_list_manager import ManifestListManager
 from pypaimon.manifest.schema.manifest_entry import ManifestEntry
 from pypaimon.manifest.schema.manifest_file_meta import ManifestFileMeta
 from pypaimon.manifest.simple_stats_evolutions import SimpleStatsEvolutions
+from pypaimon.schema.data_types import DataField
 from pypaimon.read.plan import Plan
-from pypaimon.read.push_down_utils import (remove_row_id_filter,
+from pypaimon.read.push_down_utils import (_get_all_fields,
+                                           remove_row_id_filter,
                                            trim_and_transform_predicate)
 from pypaimon.read.scanner.append_table_split_generator import \
     AppendTableSplitGenerator
+from pypaimon.read.scanner.bucket_select_converter import \
+    create_bucket_selector
 from pypaimon.read.scanner.data_evolution_split_generator import \
     DataEvolutionSplitGenerator
 from pypaimon.read.scanner.primary_key_table_split_generator import \
     PrimaryKeyTableSplitGenerator
 from pypaimon.read.split import DataSplit
-from pypaimon.snapshot.snapshot_manager import SnapshotManager
+from pypaimon.snapshot.snapshot import Snapshot
 from pypaimon.table.bucket_mode import BucketMode
 from pypaimon.table.source.deletion_file import DeletionFile
 
@@ -165,9 +169,10 @@ class FileScanner:
     def __init__(
         self,
         table,
-        manifest_scanner: Callable[[], List[ManifestFileMeta]],
+        manifest_scanner: Callable[[], Tuple[List[ManifestFileMeta], Optional[Snapshot]]],
         predicate: Optional[Predicate] = None,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        partition_predicate: Optional[Predicate] = None
     ):
         from pypaimon.table.file_store_table import FileStoreTable
 
@@ -177,15 +182,18 @@ class FileScanner:
         self.predicate_for_stats = remove_row_id_filter(predicate) if predicate else None
         self.limit = limit
 
-        self.snapshot_manager = SnapshotManager(table)
+        self.snapshot_manager = table.snapshot_manager()
         self.manifest_list_manager = ManifestListManager(table)
         self.manifest_file_manager = ManifestFileManager(table)
 
         self.primary_key_predicate = trim_and_transform_predicate(
             self.predicate, self.table.field_names, self.table.trimmed_primary_keys)
 
-        self.partition_key_predicate = trim_and_transform_predicate(
-            self.predicate, self.table.field_names, self.table.partition_keys)
+        if partition_predicate is None:
+            self.partition_key_predicate = trim_and_transform_predicate(
+                self.predicate, self.table.field_names, self.table.partition_keys)
+        else:
+            self.partition_key_predicate = partition_predicate
         options = self.table.options
         # Get split target size and open file cost from table options
         self.target_split_size = options.source_split_target_size()
@@ -200,6 +208,14 @@ class FileScanner:
         self.data_evolution = options.data_evolution_enabled()
         self.deletion_vectors_enabled = options.deletion_vectors_enabled()
         self._global_index_result = None
+        self._scanned_snapshot = None
+        self._scanned_snapshot_id = None
+
+        # Predicate-driven bucket pruning (HASH_FIXED only). Mirrors Java
+        # BucketSelectConverter. Set on demand and reused across all
+        # _filter_manifest_entry calls; the inner _Selector caches the
+        # bucket set per ``total_buckets`` value.
+        self._bucket_selector = self._init_bucket_selector()
 
         def schema_fields_func(schema_id: int):
             return self.table.schema_manager.get_schema(schema_id).fields
@@ -216,7 +232,8 @@ class FileScanner:
         bucket_files = set()
         for e in entries:
             bucket_files.add((tuple(e.partition.values), e.bucket))
-        return self._scan_dv_index(self.snapshot_manager.get_latest_snapshot(), bucket_files)
+        snapshot = self._scanned_snapshot if self._scanned_snapshot else self.snapshot_manager.get_latest_snapshot()
+        return self._scan_dv_index(snapshot, bucket_files)
 
     def scan(self) -> Plan:
         start_ms = time.time() * 1000
@@ -241,7 +258,7 @@ class FileScanner:
             )
 
         if not entries:
-            return Plan([])
+            return Plan([], snapshot_id=self._scanned_snapshot_id)
 
         # Configure sharding if needed
         if self.idx_of_this_subtask is not None:
@@ -258,7 +275,7 @@ class FileScanner:
             "File store scan plan completed in %d ms. Files size: %d",
             duration_ms, len(entries)
         )
-        return Plan(splits)
+        return Plan(splits, snapshot_id=self._scanned_snapshot_id)
 
     def _create_data_evolution_split_generator(self):
         row_ranges = None
@@ -272,7 +289,9 @@ class FileScanner:
         if row_ranges is None and self.predicate is not None:
             row_ranges = _row_ranges_from_predicate(self.predicate)
 
-        manifest_files = self.manifest_scanner()
+        manifest_files, snapshot = self.manifest_scanner()
+        self._scanned_snapshot = snapshot
+        self._scanned_snapshot_id = snapshot.id if snapshot else None
 
         # Filter manifest files by row ranges if available
         if row_ranges is not None:
@@ -293,7 +312,9 @@ class FileScanner:
         )
 
     def plan_files(self) -> List[ManifestEntry]:
-        manifest_files = self.manifest_scanner()
+        manifest_files, snapshot = self.manifest_scanner()
+        self._scanned_snapshot = snapshot
+        self._scanned_snapshot_id = snapshot.id if snapshot else None
         if len(manifest_files) == 0:
             return []
         return self.read_manifest_entries(manifest_files)
@@ -328,8 +349,36 @@ class FileScanner:
         return self.manifest_file_manager.read_entries_parallel(
             manifest_files,
             self._filter_manifest_entry,
-            max_workers=max_workers
+            max_workers=max_workers,
+            early_entry_filter=self._build_early_bucket_filter(),
         )
+
+    def _build_early_bucket_filter(self):
+        """Compose the (bucket, total_buckets) -> bool used by the manifest
+        reader to drop entries before deserialising ``_FILE`` / partition.
+
+        The selector is partition-aware now, but at this early stage the
+        partition field has not been deserialised yet, so callers stick
+        with the two-arg form. The selector internally falls back to a
+        partition-agnostic over-approximation; per-partition tightening
+        still happens later in ``_filter_manifest_entry`` once the entry
+        is fully decoded.
+        """
+        only_real = self.only_read_real_buckets
+        selector = self._bucket_selector
+        if not only_real and selector is None:
+            return None
+
+        def _filter(bucket: int, total_buckets: int) -> bool:
+            if only_real and bucket < 0:
+                return False
+            if (selector is not None
+                    and bucket >= 0
+                    and not selector(bucket, total_buckets)):
+                return False
+            return True
+
+        return _filter
 
     def with_shard(self, idx_of_this_subtask: int, number_of_para_subtasks: int) -> 'FileScanner':
         if idx_of_this_subtask >= number_of_para_subtasks:
@@ -354,19 +403,33 @@ class FileScanner:
         return self
 
     def _apply_push_down_limit(self, splits: List[DataSplit]) -> List[DataSplit]:
+        """Mirror Java ``DataTableBatchScan.applyPushDownLimit``: sum the
+        DV-aware ``merged_row_count`` (== Java ``Split.mergedRowCount()``)
+        until the limit is met. Splits with unknown merged count fall
+        through to the reader unchanged.
+        """
         if self.limit is None:
             return splits
-        scanned_row_count = 0
-        limited_splits = []
+        if self._has_non_partition_filter():
+            return splits
 
+        scanned_row_count = 0
+        limited_splits: List[DataSplit] = []
         for split in splits:
-            if split.raw_convertible:
+            merged = split.merged_row_count()
+            if merged is not None:
                 limited_splits.append(split)
-                scanned_row_count += split.row_count
+                scanned_row_count += merged
                 if scanned_row_count >= self.limit:
                     return limited_splits
-
         return splits
+
+    def _has_non_partition_filter(self) -> bool:
+        """Mirror Java ``SnapshotReaderImpl.hasNonPartitionFilter``."""
+        if self.predicate is None:
+            return False
+        partition_keys = set(self.table.partition_keys or [])
+        return not _get_all_fields(self.predicate).issubset(partition_keys)
 
     def _filter_manifest_file(self, file: ManifestFileMeta) -> bool:
         if not self.partition_key_predicate:
@@ -375,8 +438,75 @@ class FileScanner:
             file.partition_stats,
             file.num_added_files + file.num_deleted_files)
 
+    def _init_bucket_selector(self):
+        """Build the predicate-driven bucket selector if (and only if) the
+        table is in HASH_FIXED mode and the predicate pins all bucket-key
+        fields to Equal/In literals. Anything else returns None — the
+        caller treats None as "no bucket-level pruning".
+
+        Bucket-key fields come from ``TableSchema.logical_bucket_key_fields``
+        — the same source the writer's ``FixedBucketRowKeyExtractor`` reads
+        from, which is what makes the read/write hash agreement a property
+        of the schema rather than of any particular extractor instance.
+
+        Sound across rescale: ``_Selector`` caches per ``total_buckets``,
+        which can vary between manifest entries after a bucket rescale.
+        """
+        if self.predicate is None:
+            return None
+        # ``bucket_mode()`` returns HASH_FIXED only when ``options.bucket()
+        # > 0``; other modes (DYNAMIC / POSTPONE / UNAWARE / CROSS_PARTITION)
+        # have no fixed hash → bucket mapping at write time and must NOT
+        # be pruned here.
+        try:
+            if self.table.bucket_mode() != BucketMode.HASH_FIXED:
+                return None
+        except Exception:
+            # Defensive: any catalog/proxy table that fails the mode check
+            # falls back to no pruning rather than crashing the scan.
+            return None
+        # Only the default hash function (Math.abs(hash % numBuckets)) is
+        # supported for bucket pruning. Non-default functions (mod, hive)
+        # use different algorithms and would produce wrong bucket sets.
+        bucket_func = self.table.table_schema.options.get('bucket-function.type', 'default')
+        if bucket_func.lower() != 'default':
+            return None
+        try:
+            bucket_key_fields = self.table.table_schema.logical_bucket_key_fields
+        except Exception:
+            # ``bucket_keys`` raises on misconfigured ``bucket-key`` (e.g.
+            # references an unknown column). The previous extractor-based
+            # path failed open here; preserve that — pruning is an
+            # optimisation, never a correctness requirement.
+            return None
+        if not bucket_key_fields:
+            return None
+        # Partition fields are passed so the selector can specialise
+        # the predicate per partition value at the late filter stage,
+        # turning ``(part='a' AND bk=1) OR (part='b' AND bk=2)`` into a
+        # precise bucket pick per partition instead of an over-scan.
+        partition_fields: Optional[List[DataField]] = None
+        if self.table.partition_keys:
+            partition_fields = [
+                self.table.field_dict[name]
+                for name in self.table.partition_keys
+                if name in self.table.field_dict
+            ]
+        return create_bucket_selector(
+            self.predicate, bucket_key_fields,
+            partition_fields=partition_fields,
+        )
+
     def _filter_manifest_entry(self, entry: ManifestEntry) -> bool:
+        # Redundant safety net: the early filter in the manifest reader
+        # already enforces these, but guard here too so this method is
+        # self-contained if called outside read_entries_parallel.
         if self.only_read_real_buckets and entry.bucket < 0:
+            return False
+        if (self._bucket_selector is not None
+                and entry.bucket >= 0
+                and not self._bucket_selector(
+                    entry.partition, entry.bucket, entry.total_buckets)):
             return False
         if self.partition_key_predicate and not self.partition_key_predicate.test(entry.partition):
             return False

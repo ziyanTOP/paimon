@@ -181,6 +181,34 @@ class SchemaValidationTest {
     }
 
     @Test
+    public void testNestedRowAggregateOptionRejected() {
+        // PAIMON-6471: nested-path agg config was silently ignored, leaving the parent ROW
+        // on the default aggregator and producing wrong results without any error.
+        List<DataField> fields =
+                Arrays.asList(
+                        new DataField(0, "id", DataTypes.INT()),
+                        new DataField(
+                                1,
+                                "data",
+                                DataTypes.ROW(
+                                        DataTypes.FIELD(2, "num", DataTypes.INT()),
+                                        DataTypes.FIELD(3, "info", DataTypes.STRING()))));
+
+        Map<String, String> options = new HashMap<>();
+        options.put("merge-engine", "aggregation");
+        options.put("fields.data.num.aggregate-function", "sum");
+        options.put("fields.data.sequence-group", "data");
+        options.put(BUCKET.key(), "1");
+
+        TableSchema schema =
+                new TableSchema(1, fields, 10, emptyList(), singletonList("id"), options, "");
+
+        assertThatThrownBy(() -> validateTableSchema(schema))
+                .hasMessageContaining("Nested-field path is not supported on ROW field 'data'")
+                .hasMessageContaining("fields.data.num.aggregate-function");
+    }
+
+    @Test
     public void testChainTableAllowsNonDeduplicateMergeEngine() {
         Map<String, String> options = new HashMap<>();
         options.put(CoreOptions.CHAIN_TABLE_ENABLED.key(), "true");
@@ -313,5 +341,32 @@ class SchemaValidationTest {
                                                 "")))
                 .hasMessage(
                         "Data evolution config must enabled for table with vector-store file format.");
+    }
+
+    @Test
+    void testRowTrackingWithPkTable() {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.ROW_TRACKING_ENABLED.key(), "true");
+        options.put(BUCKET.key(), String.valueOf(-2));
+
+        List<DataField> fields =
+                Arrays.asList(
+                        new DataField(0, "f0", DataTypes.INT()),
+                        new DataField(1, "f1", DataTypes.INT()),
+                        new DataField(2, "f2", DataTypes.STRING()));
+        List<String> primaryKeys = singletonList("f1");
+
+        assertThatThrownBy(
+                        () ->
+                                validateTableSchema(
+                                        new TableSchema(
+                                                1,
+                                                fields,
+                                                10,
+                                                emptyList(),
+                                                primaryKeys,
+                                                options,
+                                                "")))
+                .hasMessageContaining("primary-key");
     }
 }

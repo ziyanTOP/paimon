@@ -156,3 +156,43 @@ class AlterFunctionRequest(RESTRequest):
         return {
             self.FIELD_CHANGES: [c.to_dict() for c in self.changes]
         }
+
+
+# Wire DTO for ``POST /databases/{db}/tables/{tbl}/tags``. Mirrors Java
+# ``CreateTagRequest`` (paimon-api/.../rest/requests/CreateTagRequest.java) — only
+# three fields are serialized. ``ignoreIfExists`` is intentionally NOT included
+# here; it is a client-side flag handled by ``RESTCatalog.create_tag``, not part
+# of the wire format.
+@dataclass
+class CreateTagRequest(RESTRequest):
+    FIELD_TAG_NAME = "tagName"
+    FIELD_SNAPSHOT_ID = "snapshotId"
+    FIELD_TIME_RETAINED = "timeRetained"
+
+    tag_name: str = json_field(FIELD_TAG_NAME)
+    snapshot_id: Optional[int] = json_field(FIELD_SNAPSHOT_ID, default=None)
+    time_retained: Optional[str] = json_field(FIELD_TIME_RETAINED, default=None)
+
+
+# Branch CRUD wire DTOs. Mirrors Java requests in
+# paimon-api/.../rest/requests/.
+@dataclass
+class CreateBranchRequest(RESTRequest):
+    FIELD_BRANCH = "branch"
+    FIELD_FROM_TAG = "fromTag"
+
+    branch: str = json_field(FIELD_BRANCH)
+    from_tag: Optional[str] = json_field(FIELD_FROM_TAG, default=None)
+
+
+@dataclass
+class RenameBranchRequest(RESTRequest):
+    FIELD_TO_BRANCH = "toBranch"
+
+    to_branch: str = json_field(FIELD_TO_BRANCH)
+
+
+@dataclass
+class ForwardBranchRequest(RESTRequest):
+    """Empty body request; serializes to ``{}`` per Java ForwardBranchRequest."""
+    pass

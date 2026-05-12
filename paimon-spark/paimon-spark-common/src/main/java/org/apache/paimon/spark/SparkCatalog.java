@@ -457,6 +457,7 @@ public class SparkCatalog extends SparkBaseCatalog
             StructType schema, Transform[] partitions, Map<String, String> properties) {
         Map<String, String> normalizedProperties = new HashMap<>(properties);
         List<String> blobFields = CoreOptions.blobField(properties);
+        List<String> blobViewFields = CoreOptions.blobViewField(properties);
         String provider = properties.get(TableCatalog.PROP_PROVIDER);
         if (!usePaimon(provider)) {
             if (isFormatTable(provider)) {
@@ -490,7 +491,7 @@ public class SparkCatalog extends SparkBaseCatalog
         for (StructField field : schema.fields()) {
             String name = field.name();
             DataType type;
-            if (blobFields.contains(name)) {
+            if (blobFields.contains(name) || blobViewFields.contains(name)) {
                 checkArgument(
                         field.dataType() instanceof org.apache.spark.sql.types.BinaryType,
                         "The type of blob field must be binary");
@@ -664,7 +665,11 @@ public class SparkCatalog extends SparkBaseCatalog
             } else if (table instanceof ObjectTable) {
                 return new SparkObjectTable((ObjectTable) table);
             } else {
-                return new SparkTable(table);
+                // Access the Scala companion object explicitly: Scala's static forwarder for
+                // `SparkTable.of` is not reliably emitted on all toolchains (observed missing in
+                // the shaded `paimon-spark-3.3_2.12` jar, producing NoSuchMethodError at spark-sql
+                // startup). Going through MODULE$ always resolves to the companion's method.
+                return SparkTable$.MODULE$.of(table);
             }
         } catch (Catalog.TableNotExistException e) {
             throw new NoSuchTableException(ident);

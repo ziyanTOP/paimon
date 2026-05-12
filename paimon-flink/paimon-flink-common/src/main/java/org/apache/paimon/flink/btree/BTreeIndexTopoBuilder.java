@@ -34,6 +34,7 @@ import org.apache.paimon.flink.sorter.TableSortInfo;
 import org.apache.paimon.flink.sorter.TableSorter;
 import org.apache.paimon.flink.utils.BoundedOneInputOperator;
 import org.apache.paimon.flink.utils.JavaTypeInfo;
+import org.apache.paimon.flink.utils.StreamExecutionEnvironmentUtils;
 import org.apache.paimon.globalindex.GlobalIndexParallelWriter;
 import org.apache.paimon.globalindex.btree.BTreeGlobalIndexBuilder;
 import org.apache.paimon.globalindex.btree.BTreeIndexOptions;
@@ -84,7 +85,7 @@ public class BTreeIndexTopoBuilder {
             PartitionPredicate partitionPredicate,
             Options userOptions)
             throws Exception {
-        DataStream<Committable> allCommitMessages = null;
+        List<DataStream<Committable>> allStreams = new ArrayList<>();
         for (String indexColumn : indexColumns) {
             BTreeGlobalIndexBuilder indexBuilder =
                     indexBuilderSupplier.get().withIndexField(indexColumn);
@@ -159,15 +160,15 @@ public class BTreeIndexTopoBuilder {
                                     recordsPerRange,
                                     maxParallelism);
 
-                    allCommitMessages =
-                            allCommitMessages == null
-                                    ? commitMessages
-                                    : allCommitMessages.union(commitMessages);
+                    allStreams.add(commitMessages);
                 }
             }
         }
-        if (allCommitMessages != null) {
-            commit(table, allCommitMessages);
+        if (!allStreams.isEmpty()) {
+            @SuppressWarnings("unchecked")
+            DataStream<Committable>[] rest =
+                    allStreams.subList(1, allStreams.size()).toArray(new DataStream[0]);
+            commit(table, allStreams.get(0).union(rest));
         }
 
         return true;
@@ -211,7 +212,10 @@ public class BTreeIndexTopoBuilder {
         parallelism = Math.min(parallelism, maxParallelism);
 
         DataStream<Split> sourceStream =
-                env.fromData(new JavaTypeInfo<>(Split.class), rangeSplits.toArray(new Split[0]))
+                StreamExecutionEnvironmentUtils.fromData(
+                                env,
+                                new JavaTypeInfo<>(Split.class),
+                                rangeSplits.toArray(new Split[0]))
                         .name("Global Index Source " + " range=" + range)
                         .setParallelism(1);
 

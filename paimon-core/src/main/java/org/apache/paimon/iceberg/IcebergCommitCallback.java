@@ -59,6 +59,7 @@ import org.apache.paimon.table.source.DeletionFile;
 import org.apache.paimon.table.source.RawFile;
 import org.apache.paimon.table.source.ScanMode;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
+import org.apache.paimon.tag.Tag;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.DataFilePathFactories;
@@ -85,6 +86,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
@@ -548,7 +550,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                             addedFiles,
                             modifiedPartitions,
                             baseDataManifestFileMetas,
-                            snapshotId);
+                            snapshotId,
+                            snapshot.commitKind());
             newDataManifestFileMetas = result.getLeft();
             snapshotSummary = result.getRight();
         }
@@ -778,7 +781,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                     Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles,
                     List<BinaryRow> modifiedPartitions,
                     List<IcebergManifestFileMeta> baseManifestFileMetas,
-                    long currentSnapshotId)
+                    long currentSnapshotId,
+                    Snapshot.CommitKind commitKind)
                     throws IOException {
         IcebergSnapshotSummary snapshotSummary = IcebergSnapshotSummary.APPEND;
         List<IcebergManifestFileMeta> newManifestFileMetas = new ArrayList<>();
@@ -833,7 +837,10 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                     newManifestFileMetas.add(fileMeta);
                 } else {
                     // some file is removed, rewrite this file meta
-                    snapshotSummary = IcebergSnapshotSummary.OVERWRITE;
+                    snapshotSummary =
+                            commitKind == Snapshot.CommitKind.COMPACT
+                                    ? IcebergSnapshotSummary.REPLACE
+                                    : IcebergSnapshotSummary.OVERWRITE;
                     List<IcebergManifestEntry> newEntries = new ArrayList<>();
                     for (IcebergManifestEntry entry : entries) {
                         if (entry.isLive()) {
@@ -1016,8 +1023,18 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
 
     @Override
     public void notifyCreation(String tagName) {
-        throw new UnsupportedOperationException(
-                "IcebergCommitCallback notifyCreation requires a snapshot ID");
+        // The base TagCallback API does not carry a snapshot id, but Iceberg refs
+        // require one. The tag is persisted by TagManager before this callback
+        // fires, so resolve the snapshot the tag points to and delegate to the
+        // snapshot aware overload.
+        Optional<Tag> tag = table.tagManager().get(tagName);
+        if (!tag.isPresent()) {
+            LOG.info(
+                    "Tag {} not found in Paimon TagManager when creating Iceberg ref. Unable to create tag.",
+                    tagName);
+            return;
+        }
+        notifyCreation(tagName, tag.get().id());
     }
 
     @Override

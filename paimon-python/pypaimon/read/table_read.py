@@ -40,7 +40,8 @@ class TableRead:
         table,
         predicate: Optional[Predicate],
         read_type: List[DataField],
-        include_row_kind: bool = False
+        include_row_kind: bool = False,
+        nested_name_paths: Optional[List[List[str]]] = None,
     ):
         from pypaimon.table.file_store_table import FileStoreTable
 
@@ -48,6 +49,7 @@ class TableRead:
         self.predicate = predicate
         self.read_type = read_type
         self.include_row_kind = include_row_kind
+        self.nested_name_paths = nested_name_paths
 
     def to_iterator(self, splits: List[Split]) -> Iterator:
         def _record_generator():
@@ -232,7 +234,16 @@ class TableRead:
             raise ValueError(f"override_num_blocks must be at least 1, got {override_num_blocks}")
 
         from pypaimon.read.datasource.ray_datasource import RayDatasource
-        datasource = RayDatasource(self, splits)
+        from pypaimon.read.datasource.split_provider import PreResolvedSplitProvider
+
+        datasource = RayDatasource(
+            PreResolvedSplitProvider(
+                table=self.table,
+                splits=splits,
+                read_type=self.read_type,
+                predicate=self.predicate,
+            )
+        )
         return ray.data.read_datasource(
             datasource,
             ray_remote_args=ray_remote_args,
@@ -259,20 +270,35 @@ class TableRead:
 
     def _create_split_read(self, split: Split) -> SplitRead:
         if self.table.is_primary_key_table and not split.raw_convertible:
+            inner_read_type = self.read_type
+            outer_extract_name_paths: Optional[List[List[str]]] = None
+            if self.nested_name_paths and any(
+                    len(p) > 1 for p in self.nested_name_paths):
+                # Inner: full ROW for the merge function. Outer: extract
+                # the requested sub-paths back to the user's flat schema.
+                inner_read_type = self._widen_to_top_level_for_merge()
+                outer_extract_name_paths = self.nested_name_paths
             return MergeFileSplitRead(
                 table=self.table,
                 predicate=self.predicate,
-                read_type=self.read_type,
+                read_type=inner_read_type,
                 split=split,
-                row_tracking_enabled=False
+                row_tracking_enabled=False,
+                outer_extract_name_paths=outer_extract_name_paths,
             )
         elif self.table.options.data_evolution_enabled():
+            if self.nested_name_paths and any(
+                    len(p) > 1 for p in self.nested_name_paths):
+                raise NotImplementedError(
+                    "Nested-field projection on data-evolution tables is "
+                    "not yet supported")
             return DataEvolutionSplitRead(
                 table=self.table,
                 predicate=self.predicate,
                 read_type=self.read_type,
                 split=split,
-                row_tracking_enabled=True
+                row_tracking_enabled=True,
+                nested_name_paths=self.nested_name_paths,
             )
         else:
             return RawFileSplitRead(
@@ -280,8 +306,27 @@ class TableRead:
                 predicate=self.predicate,
                 read_type=self.read_type,
                 split=split,
-                row_tracking_enabled=self.table.options.row_tracking_enabled()
+                row_tracking_enabled=self.table.options.row_tracking_enabled(),
+                nested_name_paths=self.nested_name_paths,
             )
+
+    def _widen_to_top_level_for_merge(self) -> List[DataField]:
+        """Unique top-level fields from ``self.nested_name_paths``, in path order."""
+        table_fields_by_name = {f.name: f for f in self.table.fields}
+        seen = set()
+        widened: List[DataField] = []
+        for path in self.nested_name_paths or []:
+            top_name = path[0]
+            if top_name in seen:
+                continue
+            seen.add(top_name)
+            field = table_fields_by_name.get(top_name)
+            if field is None:
+                raise ValueError(
+                    "Nested projection top-level field %r not found in "
+                    "table schema" % (top_name,))
+            widened.append(field)
+        return widened
 
     @staticmethod
     def convert_rows_to_arrow_batch(row_tuples: List[tuple], schema: pyarrow.Schema) -> pyarrow.RecordBatch:

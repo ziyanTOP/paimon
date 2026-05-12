@@ -165,13 +165,19 @@ public class SchemaValidation {
         FileFormat fileFormat =
                 FileFormat.fromIdentifier(options.formatType(), new Options(schema.options()));
         RowType tableRowType = new RowType(schema.fields());
-        Set<String> blobDescriptorFields = validateBlobDescriptorFields(tableRowType, options);
+        Set<String> blobFields = validateBlobFields(tableRowType, options);
+        Set<String> blobDescriptorFields =
+                validateBlobDescriptorFields(tableRowType, options, blobFields);
+        Set<String> blobViewFields =
+                validateBlobViewFields(tableRowType, options, blobFields, blobDescriptorFields);
+        Set<String> blobInlineFields = new HashSet<>(blobDescriptorFields);
+        blobInlineFields.addAll(blobViewFields);
         validateBlobExternalStorageFields(tableRowType, options, blobDescriptorFields);
 
         List<DataField> fieldsInNormalFile = new ArrayList<>();
         Set<String> fieldsInDedicatedFile =
                 SetUtils.union(
-                        fieldNamesInBlobFile(tableRowType, blobDescriptorFields),
+                        fieldNamesInBlobFile(tableRowType, blobInlineFields),
                         fieldNamesInVectorFile(tableRowType, options.withVectorFormat()));
         for (DataField field : tableRowType.getFields()) {
             if (!fieldsInDedicatedFile.contains(field.name())) {
@@ -202,13 +208,6 @@ public class SchemaValidation {
                             "Doesn't support streaming read the changes from overwrite when the primary keys are "
                                     + "not defined. Please use %s to enable the streaming read overwrite commit for append table.",
                             CoreOptions.STREAMING_READ_APPEND_OVERWRITE.key()));
-        }
-
-        if (schema.options().containsKey(CoreOptions.PARTITION_EXPIRATION_TIME.key())) {
-            if (schema.partitionKeys().isEmpty()) {
-                throw new IllegalArgumentException(
-                        "Can not set 'partition.expiration-time' for non-partitioned table.");
-            }
         }
 
         String recordLevelTimeField = options.recordLevelTimeField();
@@ -494,7 +493,8 @@ public class SchemaValidation {
                 .forEach(
                         k -> {
                             if (k.startsWith(FIELDS_PREFIX)) {
-                                String[] fields = k.split("\\.")[1].split(FIELDS_SEPARATOR);
+                                String[] segments = k.split("\\.");
+                                String[] fields = segments[1].split(FIELDS_SEPARATOR);
                                 for (String field : fields) {
                                     checkArgument(
                                             DEFAULT_AGG_FUNCTION.equals(field)
@@ -502,6 +502,23 @@ public class SchemaValidation {
                                             String.format(
                                                     "Field %s can not be found in table schema.",
                                                     field));
+                                }
+                                // PAIMON-6471: dot paths into a ROW field's members
+                                // (e.g. fields.row.inner.aggregate-function) are silently
+                                // dropped today and produce wrong results. This check
+                                // rejects them.
+                                if (segments.length > 3 && fields.length == 1) {
+                                    String parent = fields[0];
+                                    schema.fields().stream()
+                                            .filter(f -> f.name().equals(parent))
+                                            .findFirst()
+                                            .ifPresent(
+                                                    f ->
+                                                            checkArgument(
+                                                                    !(f.type() instanceof RowType),
+                                                                    "Nested-field path is not supported on ROW field '%s': %s",
+                                                                    parent,
+                                                                    k));
                                 }
                             }
                         });
@@ -522,7 +539,7 @@ public class SchemaValidation {
                         || options.changelogProducer() == ChangelogProducer.LOOKUP,
                 "Deletion vectors mode is only supported for NONE/INPUT/LOOKUP changelog producer now.");
 
-        // pk-clustering-override mode requires deletion vectors even for first-row
+        // pk-clustering-override mode allows deletion vectors for first-row
         if (!options.pkClusteringOverride()) {
             checkArgument(
                     !options.mergeEngine().equals(MergeEngine.FIRST_ROW),
@@ -648,13 +665,13 @@ public class SchemaValidation {
         boolean rowTrackingEnabled = options.rowTrackingEnabled();
         if (rowTrackingEnabled) {
             checkArgument(
-                    options.bucket() == -1,
-                    "Cannot define %s for row tracking table, it only support bucket = -1",
-                    CoreOptions.BUCKET.key());
-            checkArgument(
                     schema.primaryKeys().isEmpty(),
                     "Cannot define %s for row tracking table.",
                     PRIMARY_KEY.key());
+            checkArgument(
+                    options.bucket() == -1,
+                    "Cannot define %s for row tracking table, it only support bucket = -1",
+                    CoreOptions.BUCKET.key());
         }
 
         if (options.dataEvolutionEnabled()) {
@@ -702,7 +719,27 @@ public class SchemaValidation {
         }
     }
 
-    private static Set<String> validateBlobDescriptorFields(RowType rowType, CoreOptions options) {
+    private static Set<String> validateBlobFields(RowType rowType, CoreOptions options) {
+        Set<String> blobFieldNames =
+                rowType.getFields().stream()
+                        .filter(field -> field.type().getTypeRoot() == DataTypeRoot.BLOB)
+                        .map(DataField::name)
+                        .collect(Collectors.toCollection(HashSet::new));
+        Set<String> configured =
+                CoreOptions.blobField(options.toMap()).stream()
+                        .collect(Collectors.toCollection(HashSet::new));
+        for (String field : configured) {
+            checkArgument(
+                    blobFieldNames.contains(field),
+                    "Field '%s' in '%s' must be a BLOB field in table schema.",
+                    field,
+                    CoreOptions.BLOB_FIELD.key());
+        }
+        return configured;
+    }
+
+    private static Set<String> validateBlobDescriptorFields(
+            RowType rowType, CoreOptions options, Set<String> blobFields) {
         Set<String> blobFieldNames =
                 rowType.getFields().stream()
                         .filter(field -> field.type().getTypeRoot() == DataTypeRoot.BLOB)
@@ -714,6 +751,45 @@ public class SchemaValidation {
                     blobFieldNames.contains(field),
                     "Field '%s' in '%s' must be a BLOB field in table schema.",
                     field,
+                    CoreOptions.BLOB_DESCRIPTOR_FIELD.key());
+            checkArgument(
+                    blobFields.contains(field),
+                    "Field '%s' in '%s' must also be in '%s'.",
+                    field,
+                    CoreOptions.BLOB_DESCRIPTOR_FIELD.key(),
+                    CoreOptions.BLOB_FIELD.key());
+        }
+        return configured;
+    }
+
+    private static Set<String> validateBlobViewFields(
+            RowType rowType,
+            CoreOptions options,
+            Set<String> blobFields,
+            Set<String> blobDescriptorFields) {
+        Set<String> blobFieldNames =
+                rowType.getFields().stream()
+                        .filter(field -> field.type().getTypeRoot() == DataTypeRoot.BLOB)
+                        .map(DataField::name)
+                        .collect(Collectors.toCollection(HashSet::new));
+        Set<String> configured = options.blobViewField();
+        for (String field : configured) {
+            checkArgument(
+                    blobFieldNames.contains(field),
+                    "Field '%s' in '%s' must be a BLOB field in table schema.",
+                    field,
+                    CoreOptions.BLOB_VIEW_FIELD.key());
+            checkArgument(
+                    blobFields.contains(field),
+                    "Field '%s' in '%s' must also be in '%s'.",
+                    field,
+                    CoreOptions.BLOB_VIEW_FIELD.key(),
+                    CoreOptions.BLOB_FIELD.key());
+            checkArgument(
+                    !blobDescriptorFields.contains(field),
+                    "Field '%s' in '%s' can not also be in '%s'.",
+                    field,
+                    CoreOptions.BLOB_VIEW_FIELD.key(),
                     CoreOptions.BLOB_DESCRIPTOR_FIELD.key());
         }
         return configured;
@@ -847,7 +923,8 @@ public class SchemaValidation {
                 throw new IllegalArgumentException(
                         "Cannot support 'pk-clustering-override' mode without 'clustering.columns'.");
             }
-            if (!options.deletionVectorsEnabled()) {
+            if (!options.deletionVectorsEnabled()
+                    && options.mergeEngine() != CoreOptions.MergeEngine.FIRST_ROW) {
                 throw new UnsupportedOperationException(
                         "Cannot support deletion-vectors disabled in 'pk-clustering-override' mode.");
             }

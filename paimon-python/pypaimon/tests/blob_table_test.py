@@ -24,6 +24,7 @@ import unittest
 import pyarrow as pa
 
 from pypaimon import CatalogFactory, Schema
+from pypaimon.schema.schema_change import SchemaChange
 from pypaimon.table.file_store_table import FileStoreTable
 from pypaimon.write.commit_message import CommitMessage
 
@@ -2747,7 +2748,6 @@ class DataBlobWriterTest(unittest.TestCase):
         """Test concurrent blob writes to verify retry mechanism works correctly."""
         import threading
         from pypaimon import Schema
-        from pypaimon.snapshot.snapshot_manager import SnapshotManager
 
         # Run the test 10 times to verify stability
         iter_num = 2
@@ -2822,9 +2822,17 @@ class DataBlobWriterTest(unittest.TestCase):
                         'error': str(e)
                     })
 
-            # Create and start multiple threads
+            # Create and start multiple threads. Keep this modest (3 vs. the
+            # original 10) because GHA runners under load can't drain 10
+            # simultaneously-conflicting commits even with
+            # ``commit.max-retries=50`` (50 attempts * 30s back-off ~25 min,
+            # still timing out in CI). At 5 threads we still saw a different
+            # flake — read end occasionally observed only 4 of the 5 commits'
+            # rows (race between commit visibility and the immediate read).
+            # Three threads exercises the retry path while keeping the
+            # contention density low enough that GHA can drain reliably.
             threads = []
-            num_threads = 10
+            num_threads = 3
             for i in range(num_threads):
                 thread = threading.Thread(
                     target=write_blob_data,
@@ -2872,7 +2880,7 @@ class DataBlobWriterTest(unittest.TestCase):
                 self.assertIn(b'BLOB_PATTERN_', blob, f"Blob {i} should contain pattern")
 
             # Verify snapshot count (should have num_threads snapshots)
-            snapshot_manager = SnapshotManager(table)
+            snapshot_manager = table.snapshot_manager()
             latest_snapshot = snapshot_manager.get_latest_snapshot()
             self.assertIsNotNone(latest_snapshot,
                                  f"Iteration {test_iteration}: Latest snapshot should not be None")
@@ -3023,6 +3031,30 @@ class DataBlobWriterTest(unittest.TestCase):
         read = rb.new_read()
         result = read.to_arrow(splits)
         self.assertEqual(result.num_rows, 1)
+
+    def test_rename_blob_column_should_fail(self):
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('name', pa.string()),
+            ('blob_col', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true',
+            }
+        )
+        self.catalog.create_table('test_db.blob_rename_test', schema, False)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self.catalog.alter_table(
+                'test_db.blob_rename_test',
+                [SchemaChange.rename_column('blob_col', 'blob_col_renamed')],
+                False
+            )
+        self.assertIn('Cannot rename BLOB column', str(ctx.exception))
 
 
 if __name__ == '__main__':

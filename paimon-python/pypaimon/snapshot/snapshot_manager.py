@@ -29,16 +29,39 @@ from pypaimon.snapshot.snapshot_loader import SnapshotLoader
 class SnapshotManager:
     """Manager for snapshot files using unified FileIO."""
 
-    def __init__(self, table):
-        from pypaimon.table.file_store_table import FileStoreTable
+    def __init__(
+        self,
+        file_io: FileIO,
+        table_path: str,
+        branch: Optional[str] = None,
+        snapshot_loader: Optional[SnapshotLoader] = None,
+    ):
+        # Lazy import to avoid a cycle: pypaimon.branch.__init__
+        # eagerly loads FileSystemBranchManager, which imports
+        # SnapshotManager.
+        from pypaimon.branch.branch_manager import BranchManager
 
-        self.table: FileStoreTable = table
-        self.file_io: FileIO = self.table.file_io
-        self.snapshot_loader: Optional[SnapshotLoader] = self.table.catalog_environment.snapshot_loader()
+        self.file_io: FileIO = file_io
+        self.table_path: str = table_path.rstrip('/')
+        self.branch: str = BranchManager.normalize_branch(branch)
+        self.snapshot_loader: Optional[SnapshotLoader] = snapshot_loader
 
-        snapshot_path = self.table.table_path.rstrip('/')
-        self.snapshot_dir = f"{snapshot_path}/snapshot"
+        branch_root = BranchManager.branch_path(self.table_path, self.branch)
+        self.snapshot_dir = f"{branch_root}/snapshot"
         self.latest_file = f"{self.snapshot_dir}/LATEST"
+
+    def copy_with_branch(self, branch_name: str) -> 'SnapshotManager':
+        # Mirrors Java SnapshotManager.copyWithBranch: the new manager
+        # carries a SnapshotLoader rebranched to ``branch_name`` so REST
+        # loads target the correct branch instead of falling back to the
+        # main-branch identifier.
+        rebranched_loader = (
+            self.snapshot_loader.copy_with_branch(branch_name)
+            if self.snapshot_loader is not None
+            else None
+        )
+        return SnapshotManager(
+            self.file_io, self.table_path, branch_name, rebranched_loader)
 
     def get_latest_snapshot(self) -> Optional[Snapshot]:
         """

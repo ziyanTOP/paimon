@@ -261,6 +261,16 @@ class CoreOptions:
         .with_description("Optional tag name used in case of 'from-snapshot' scan mode.")
     )
 
+    SCAN_SNAPSHOT_ID: ConfigOption[int] = (
+        ConfigOptions.key("scan.snapshot-id")
+        .long_type()
+        .no_default_value()
+        .with_description(
+            "Optional snapshot id used in case of 'from-snapshot' or "
+            "'from-snapshot-full' scan mode."
+        )
+    )
+
     SOURCE_SPLIT_TARGET_SIZE: ConfigOption[MemorySize] = (
         ConfigOptions.key("source.split.target-size")
         .memory_type()
@@ -405,6 +415,33 @@ class CoreOptions:
         )
     )
 
+    VARIANT_SHREDDING_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("variant.shredding.enabled")
+        .boolean_type()
+        .default_value(True)
+        .with_description(
+            "Whether to enable VARIANT shredding. When True (default), writes apply the "
+            "shredding schema configured via 'variant.shreddingSchema', and reads "
+            "automatically reassemble shredded columns back to the standard "
+            "struct<value, metadata> form. Set to False to bypass both behaviours."
+        )
+    )
+
+    VARIANT_SHREDDING_SCHEMA: ConfigOption[str] = (
+        ConfigOptions.key("variant.shreddingSchema")
+        .string_type()
+        .no_default_value()
+        .with_description(
+            "JSON-encoded ROW type specifying which VARIANT sub-fields to shred when "
+            "writing Parquet (static shredding mode). The top-level fields map VARIANT "
+            "column names to their sub-field schemas. "
+            "Alias: 'parquet.variant.shreddingSchema'. "
+            "Example: '{\"type\":\"ROW\",\"fields\":[{\"id\":0,\"name\":\"payload\","
+            "\"type\":{\"type\":\"ROW\",\"fields\":[{\"id\":0,\"name\":\"age\","
+            "\"type\":\"BIGINT\"}]}}]}'"
+        )
+    )
+
     PARTITION_DEFAULT_NAME: ConfigOption[str] = (
         ConfigOptions.key("partition.default-name")
         .string_type()
@@ -412,6 +449,16 @@ class CoreOptions:
         .with_description(
             "The default partition name in case the dynamic partition"
             " column value is null/empty string."
+        )
+    )
+
+    DYNAMIC_PARTITION_OVERWRITE: ConfigOption[bool] = (
+        ConfigOptions.key("dynamic-partition-overwrite")
+        .boolean_type()
+        .default_value(True)
+        .with_description(
+            "Whether only overwrite dynamic partition when overwriting a partitioned table "
+            "with dynamic partition columns. Works only when the table has partition keys."
         )
     )
 
@@ -480,6 +527,16 @@ class CoreOptions:
     def blob_as_descriptor(self, default=None):
         return self.options.get(CoreOptions.BLOB_AS_DESCRIPTOR, default)
 
+    def variant_shredding_enabled(self) -> bool:
+        return self.options.get(CoreOptions.VARIANT_SHREDDING_ENABLED, True)
+
+    def variant_shredding_schema(self) -> Optional[str]:
+        val = self.options.get(CoreOptions.VARIANT_SHREDDING_SCHEMA)
+        if val is None:
+            # Support alias used by Java: parquet.variant.shreddingSchema
+            val = self.options.data.get("parquet.variant.shreddingSchema")
+        return val
+
     def blob_descriptor_fields(self, default=None):
         value = self.options.get(CoreOptions.BLOB_DESCRIPTOR_FIELD, default)
         if value is None:
@@ -520,6 +577,9 @@ class CoreOptions:
 
     def scan_tag_name(self, default=None):
         return self.options.get(CoreOptions.SCAN_TAG_NAME, default)
+
+    def scan_snapshot_id(self, default=None):
+        return self.options.get(CoreOptions.SCAN_SNAPSHOT_ID, default)
 
     def source_split_target_size(self, default=None):
         return self.options.get(CoreOptions.SOURCE_SPLIT_TARGET_SIZE, default).get_bytes()
@@ -585,3 +645,6 @@ class CoreOptions:
 
     def add_column_before_partition(self) -> bool:
         return self.options.get(CoreOptions.ADD_COLUMN_BEFORE_PARTITION, False)
+
+    def dynamic_partition_overwrite(self) -> bool:
+        return self.options.get(CoreOptions.DYNAMIC_PARTITION_OVERWRITE)
